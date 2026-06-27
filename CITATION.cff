@@ -1,0 +1,7 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it as below."
+title: "NVIDIA cuVS: A library for vector search on the GPU"
+date-released: "2026-06-27"
+authors:
+  - name: "NVIDIA cuVS Team"
+repository-code: "https://github.com/NVIDIA/cuvs"
