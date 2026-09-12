@@ -4552,47 +4552,6 @@ struct fd_transfer {
 
 }  // namespace detail
 
-/**
- * @brief Convert a standard-device index into a padded-device index and attach padded dataset.
- *
- * CAGRA search requires padded device layout. This helper copies graph/source-indices from
- * `standard_idx` into a new `device_padded_index` and attaches `padded_dataset`.
- *
- * @param[in] res             RAFT resources
- * @param[in] standard_idx    index returned by `build` with a standard device dataset view
- * @param[in] padded_dataset  device padded dataset view (caller owns underlying memory)
- * @return device padded index with graph and dataset ready for search
- */
-template <typename T, typename IdxT>
-auto convert_standard_to_padded_index(
-  raft::resources const& res,
-  index<T, IdxT, cuvs::neighbors::device_standard_dataset_view<T, int64_t>> const& standard_idx,
-  cuvs::neighbors::device_padded_dataset_view<T, int64_t> const& padded_dataset)
-  -> device_padded_index<T, IdxT>
-{
-  RAFT_EXPECTS(padded_dataset.n_rows() == standard_idx.size(),
-               "Padded dataset row count must match the index size");
-
-  using GraphIndexType =
-    typename index<T, IdxT, cuvs::neighbors::device_standard_dataset_view<T, int64_t>>::
-      graph_index_type;
-  auto graph_host = raft::make_host_matrix<GraphIndexType, int64_t>(standard_idx.graph().extent(0),
-                                                                    standard_idx.graph().extent(1));
-  if (standard_idx.graph().size() > 0) {
-    raft::copy(graph_host.data_handle(),
-               standard_idx.graph().data_handle(),
-               standard_idx.graph().size(),
-               raft::resource::get_cuda_stream(res));
-    raft::resource::sync_stream(res);
-  }
-  device_padded_index<T, IdxT> out(
-    res, standard_idx.metric(), padded_dataset, raft::make_const_mdspan(graph_host.view()));
-  if (standard_idx.source_indices().has_value()) {
-    out.update_source_indices(res, standard_idx.source_indices().value());
-  }
-  return out;
-}
-
 auto update_dataset(
   raft::resources const& res,
   index<float, uint32_t, host_standard_dataset_view<float, int64_t>>&& cagra_index,

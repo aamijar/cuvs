@@ -27,6 +27,14 @@
 
 namespace cuvs::neighbors::tiered_index::detail {
 
+template <typename T>
+struct is_padded_cagra_index : std::false_type {};
+
+template <typename T, typename IdxT>
+struct is_padded_cagra_index<
+  cuvs::neighbors::cagra::index<T, IdxT, cuvs::neighbors::device_padded_dataset_view<T, int64_t>>>
+  : std::true_type {};
+
 /**
   Storage for brute force based incremental indices
 
@@ -41,18 +49,27 @@ struct brute_force_storage {
   size_t num_rows_used;
   size_t num_rows_allocated;
   size_t dim;
+  size_t stride;
   bool include_norms;
 
   brute_force_storage(const raft::resources& res,
                       size_t initial_rows,
                       size_t dim,
-                      bool include_norms)
-    : dataset(initial_rows * dim * sizeof(T), raft::resource::get_cuda_stream(res)),
+                      bool include_norms,
+                      size_t stride = 0)
+    : dataset(initial_rows * (stride == 0 ? dim : stride) * sizeof(T),
+              raft::resource::get_cuda_stream(res)),
       num_rows_used(0),
       num_rows_allocated(initial_rows),
       dim(dim),
+      stride(stride == 0 ? dim : stride),
       include_norms(include_norms)
   {
+    RAFT_EXPECTS(this->stride >= dim, "Storage stride must not be smaller than logical dimension");
+    RAFT_CUDA_TRY(cudaMemsetAsync(dataset.data(),
+                                  0,
+                                  initial_rows * this->stride * sizeof(T),
+                                  raft::resource::get_cuda_stream(res).get()));
     if (include_norms) {
       norms =
         rmm::device_uvector<T>(initial_rows * sizeof(T), raft::resource::get_cuda_stream(res));
@@ -67,27 +84,45 @@ struct brute_force_storage {
   {
     RAFT_EXPECTS(num_rows_available() >= static_cast<size_t>(new_vectors.extent(0)),
                  "Insufficient storage to append new vectors");
-    RAFT_EXPECTS(dim == static_cast<size_t>(new_vectors.extent(1)),
-                 "Dimension mismatch on appending new vectors");
+    RAFT_EXPECTS(dim <= static_cast<size_t>(new_vectors.extent(1)),
+                 "Source row width is smaller than the logical dimension");
 
     // append the vectors to the end of the allocated storage
-    auto dst_ptr  = dataset.data() + num_rows_used * dim;
-    auto dst_view = raft::make_device_matrix_view<T, int64_t, raft::row_major>(
-      dst_ptr, new_vectors.extent(0), new_vectors.extent(1));
-    raft::copy(res, dst_view, new_vectors);
+    auto dst_ptr = dataset.data() + num_rows_used * stride;
+    auto stream  = raft::resource::get_cuda_stream(res);
+    RAFT_CUDA_TRY(cudaMemsetAsync(
+      dst_ptr, 0, static_cast<size_t>(new_vectors.extent(0)) * stride * sizeof(T), stream.get()));
+    raft::copy_matrix(dst_ptr,
+                      stride,
+                      new_vectors.data_handle(),
+                      new_vectors.stride(0),
+                      dim,
+                      new_vectors.extent(0),
+                      stream);
 
     if (include_norms) {
       auto norms_view =
         raft::make_device_vector_view<T>(norms->data() + num_rows_used, new_vectors.extent(0));
+      auto stored_vectors = raft::make_device_matrix_view<const T, int64_t, raft::row_major>(
+        dst_ptr, new_vectors.extent(0), stride);
       if (metric == cuvs::distance::DistanceType::CosineExpanded) {
         raft::linalg::norm<raft::linalg::NormType::L2Norm, raft::Apply::ALONG_ROWS>(
-          res, new_vectors, norms_view, raft::sqrt_op{});
+          res, stored_vectors, norms_view, raft::sqrt_op{});
       } else {
         raft::linalg::norm<raft::linalg::NormType::L2Norm, raft::Apply::ALONG_ROWS>(
-          res, new_vectors, norms_view);
+          res, stored_vectors, norms_view);
       }
     }
     num_rows_used += new_vectors.extent(0);
+  }
+
+  [[nodiscard]] auto view(size_t row_offset, size_t n_rows) const
+    -> raft::device_matrix_view<const T, int64_t, raft::row_major>
+  {
+    return raft::make_device_matrix_view<const T, int64_t, raft::row_major>(
+      dataset.data() + row_offset * stride,
+      static_cast<int64_t>(n_rows),
+      static_cast<int64_t>(stride));
   }
 };
 
@@ -115,21 +150,30 @@ struct index_state {
   index_state()    = default;
 
   /**
-   * Build upstream ANN, preserving row stride for standard CAGRA when needed.
+   * Build the upstream ANN against the tiered index's owning storage.
    */
   template <typename BuildFn, typename DatasetView>
   [[nodiscard]] static auto build_upstream_ann(
     raft::resources const& res,
     index_params<typename UpstreamT::index_params_type> const& tiered_params,
     BuildFn&& build_fn,
-    DatasetView dataset) -> std::shared_ptr<UpstreamT>
+    DatasetView dataset,
+    uint32_t logical_dim) -> std::shared_ptr<UpstreamT>
   {
-    auto index = std::forward<BuildFn>(build_fn)(res, tiered_params, dataset);
-    if constexpr (std::is_same_v<UpstreamT, cuvs::neighbors::cagra::device_standard_index<float>>) {
-      index = cuvs::neighbors::cagra::update_dataset(
-        res, std::move(index), cuvs::neighbors::make_device_standard_dataset_view(dataset));
+    if constexpr (is_padded_cagra_index<UpstreamT>::value) {
+      auto cagra_params                    = static_cast<const cagra::index_params&>(tiered_params);
+      cagra_params.attach_dataset_on_build = false;
+      auto padded_view =
+        cuvs::neighbors::device_padded_dataset_view<value_type, int64_t>(dataset, logical_dim);
+      auto index = cuvs::neighbors::cagra::build(res, cagra_params, padded_view);
+      index      = cuvs::neighbors::cagra::update_dataset(res, std::move(index), padded_view);
+      return std::make_shared<UpstreamT>(std::move(index));
+    } else {
+      RAFT_EXPECTS(dataset.extent(1) == logical_dim,
+                   "Non-CAGRA tiered storage must be tightly packed");
+      auto index = std::forward<BuildFn>(build_fn)(res, tiered_params, dataset);
+      return std::make_shared<UpstreamT>(std::move(index));
     }
-    return std::make_shared<UpstreamT>(std::move(index));
   }
 
   index_state(const index_state<UpstreamT>& other)
@@ -143,27 +187,37 @@ struct index_state {
   index_state(raft::resources const& res,
               const index_params<typename UpstreamT::index_params_type>& index_params,
               upstream_build_function_type<UpstreamT> build_fn,
-              raft::device_matrix_view<const value_type, int64_t, raft::row_major> dataset)
+              raft::device_matrix_view<const value_type, int64_t, raft::row_major> dataset,
+              uint32_t logical_dim = 0)
     : build_params(index_params), build_fn(build_fn)
   {
     // allocate new storage for growing the index, keeping only a small buffer over the initial
     // dataset size for
     auto initial_size = dataset.extent(0) + dataset.extent(0) / 16;
 
-    // Create an ANN index if we have sufficient rows in initial dataset
-    if (dataset.extent(0) > index_params.min_ann_rows) {
-      ann_index = build_upstream_ann(res, index_params, build_fn, dataset);
-    }
-
     // allocate bfknn storage for growing the index incrementally
-    auto dim       = dataset.extent(1);
+    auto dim =
+      logical_dim == 0 ? static_cast<size_t>(dataset.extent(1)) : static_cast<size_t>(logical_dim);
     auto metric    = build_params.metric;
     bool use_norms = (metric == cuvs::distance::DistanceType::L2Expanded ||
                       metric == cuvs::distance::DistanceType::L2SqrtExpanded ||
                       metric == cuvs::distance::DistanceType::CosineExpanded);
-    storage        = std::make_shared<brute_force_storage<typename UpstreamT::value_type>>(
-      res, initial_size, dim, use_norms);
+    auto stride =
+      is_padded_cagra_index<UpstreamT>::value
+        ? cuvs::neighbors::cagra_required_row_width<value_type>(static_cast<uint32_t>(dim))
+        : static_cast<uint32_t>(dim);
+    storage = std::make_shared<brute_force_storage<typename UpstreamT::value_type>>(
+      res, initial_size, dim, use_norms, stride);
     storage->append_vectors(res, dataset, metric);
+
+    // Create an ANN index if we have sufficient rows in initial dataset
+    if (dataset.extent(0) > index_params.min_ann_rows) {
+      ann_index = build_upstream_ann(res,
+                                     index_params,
+                                     build_fn,
+                                     storage->view(0, static_cast<size_t>(dataset.extent(0))),
+                                     static_cast<uint32_t>(dim));
+    }
   }
 
   size_t dim() const { return storage->dim; }
@@ -196,18 +250,35 @@ struct index_state {
         storage->norms->data() + ann_rows(), bfknn_rows());
     }
 
-    auto bfknn_dataset_view = raft::make_device_matrix_view<const value_type, int64_t>(
-      storage->dataset.data() + ann_rows() * storage->dim, bfknn_rows(), storage->dim);
+    auto bfknn_dataset_view = storage->view(ann_rows(), bfknn_rows());
 
     brute_force::index<value_type> bfknn_index(
       res, bfknn_dataset_view, norms_view, build_params.metric);
+
+    rmm::device_uvector<value_type> padded_queries(0, raft::resource::get_cuda_stream(res));
+    auto bfknn_queries = queries;
+    if (storage->stride != storage->dim) {
+      auto stream = raft::resource::get_cuda_stream(res);
+      padded_queries.resize(static_cast<size_t>(queries.extent(0)) * storage->stride, stream);
+      RAFT_CUDA_TRY(cudaMemsetAsync(
+        padded_queries.data(), 0, padded_queries.size() * sizeof(value_type), stream.get()));
+      raft::copy_matrix(padded_queries.data(),
+                        storage->stride,
+                        queries.data_handle(),
+                        queries.stride(0),
+                        storage->dim,
+                        queries.extent(0),
+                        stream);
+      bfknn_queries = raft::make_device_matrix_view<const value_type, int64_t, raft::row_major>(
+        padded_queries.data(), queries.extent(0), static_cast<int64_t>(storage->stride));
+    }
 
     // if we don't have an ANN index, just return the bfknn results right away
     if (!ann_index) {
       brute_force::search(res,
                           brute_force::search_params(),
                           bfknn_index,
-                          queries,
+                          bfknn_queries,
                           neighbors,
                           distances,
                           sample_filter);
@@ -242,7 +313,7 @@ struct index_state {
     brute_force::search(res,
                         brute_force::search_params(),
                         bfknn_index,
-                        queries,
+                        bfknn_queries,
                         bfknn_neighbors,
                         bfknn_distances,
                         sample_filter);
@@ -292,18 +363,6 @@ struct index_state {
 };
 
 /**
- * After BF storage grows, repoint CAGRA at the first \p ann_rows rows.
- */
-inline void update_cagra_ann_dataset_for_stride(
-  raft::resources const& res,
-  cuvs::neighbors::cagra::device_standard_index<float>& ann_index,
-  raft::device_matrix_view<const float, int64_t, raft::row_major> dataset)
-{
-  ann_index = cuvs::neighbors::cagra::update_dataset(
-    res, std::move(ann_index), cuvs::neighbors::make_device_standard_dataset_view(dataset));
-}
-
-/**
  * @brief Build the tiered index from the dataset for efficient search.
  *
  * @param[in] res
@@ -317,10 +376,10 @@ auto build(
   raft::resources const& res,
   const index_params<typename UpstreamT::index_params_type>& index_params,
   upstream_build_function_type<UpstreamT> build_fn,
-  raft::device_matrix_view<const typename UpstreamT::value_type, int64_t, raft::row_major> dataset)
-  -> std::shared_ptr<index_state<UpstreamT>>
+  raft::device_matrix_view<const typename UpstreamT::value_type, int64_t, raft::row_major> dataset,
+  uint32_t logical_dim = 0) -> std::shared_ptr<index_state<UpstreamT>>
 {
-  auto ret = new index_state<UpstreamT>(res, index_params, build_fn, dataset);
+  auto ret = new index_state<UpstreamT>(res, index_params, build_fn, dataset, logical_dim);
   return std::shared_ptr<index_state<UpstreamT>>(ret);
 }
 
@@ -347,11 +406,14 @@ auto merge(raft::resources const& res,
 
   auto dim           = indices[0]->state->dim();
   auto include_norms = indices[0]->state->storage->include_norms;
+  auto stride        = indices[0]->state->storage->stride;
 
   // validate data and check what needs to be merged
   size_t bfknn_rows = 0, ann_rows = 0;
   for (auto index : indices) {
     RAFT_EXPECTS(dim == index->state->dim(), "Each index must have the same dimensionality");
+    RAFT_EXPECTS(stride == index->state->storage->stride,
+                 "Each index must have the same storage stride");
     bfknn_rows += index->state->bfknn_rows();
     ann_rows += index->state->ann_rows();
   }
@@ -362,19 +424,19 @@ auto merge(raft::resources const& res,
   // concatenate all the storages together
   auto to_allocate = bfknn_rows + ann_rows;
   auto new_storage =
-    std::make_shared<brute_force_storage<value_type>>(res, to_allocate, dim, include_norms);
+    std::make_shared<brute_force_storage<value_type>>(res, to_allocate, dim, include_norms, stride);
 
   for (auto index : indices) {
     auto storage = index->state->storage;
 
     // copy over dataset to new storage
-    raft::copy(res,
-               raft::make_device_matrix_view<value_type, int64_t, raft::row_major>(
-                 new_storage->dataset.data() + new_storage->num_rows_used * dim,
-                 storage->num_rows_used,
-                 dim),
-               raft::make_device_matrix_view<const value_type, int64_t, raft::row_major>(
-                 storage->dataset.data(), storage->num_rows_used, dim));
+    raft::copy_matrix(new_storage->dataset.data() + new_storage->num_rows_used * stride,
+                      stride,
+                      storage->dataset.data(),
+                      storage->stride,
+                      dim,
+                      storage->num_rows_used,
+                      raft::resource::get_cuda_stream(res));
 
     // copy over precalculated norms
     if (include_norms) {
@@ -390,6 +452,21 @@ auto merge(raft::resources const& res,
   auto next_state          = std::make_shared<index_state<UpstreamT>>(*indices[0]->state);
   next_state->storage      = new_storage;
   next_state->build_params = index_params;
+
+  if constexpr (is_padded_cagra_index<UpstreamT>::value) {
+    if (next_state->ann_index) {
+      auto padded_view = cuvs::neighbors::device_padded_dataset_view<value_type, int64_t>(
+        next_state->storage->view(0, next_state->ann_rows()),
+        static_cast<uint32_t>(next_state->storage->dim));
+      auto old_ann = next_state->ann_index;
+      auto new_ann =
+        std::make_shared<UpstreamT>(res, old_ann->metric(), padded_view, old_ann->graph());
+      if (old_ann->source_indices().has_value()) {
+        new_ann->update_source_indices(res, old_ann->source_indices().value());
+      }
+      next_state->ann_index = std::move(new_ann);
+    }
+  }
 
   if (next_state->bfknn_rows() > static_cast<size_t>(next_state->build_params.min_ann_rows)) {
     next_state = compact(res, *next_state);
@@ -422,15 +499,17 @@ auto extend(raft::resources const& res,
     size_t min_needed  = new_vectors.extent(0) + storage->num_rows_used;
     size_t to_allocate = std::max(min_needed, 2 * storage->num_rows_allocated);
 
-    auto new_storage =
-      std::make_shared<brute_force_storage<value_type>>(res, to_allocate, dim, include_norms);
+    auto new_storage = std::make_shared<brute_force_storage<value_type>>(
+      res, to_allocate, dim, include_norms, storage->stride);
 
     // copy over dataset to new storage
-    raft::copy(res,
-               raft::make_device_matrix_view<value_type, int64_t, raft::row_major>(
-                 new_storage->dataset.data(), storage->num_rows_used, dim),
-               raft::make_device_matrix_view<const value_type, int64_t, raft::row_major>(
-                 storage->dataset.data(), storage->num_rows_used, dim));
+    raft::copy_matrix(new_storage->dataset.data(),
+                      new_storage->stride,
+                      storage->dataset.data(),
+                      storage->stride,
+                      dim,
+                      storage->num_rows_used,
+                      raft::resource::get_cuda_stream(res));
 
     // copy over precalculated norms
     if (include_norms) {
@@ -467,11 +546,14 @@ auto compact(raft::resources const& res, const index_state<UpstreamT>& current)
   // Create the new ann index based off all available data
   using value_type = typename UpstreamT::value_type;
   auto storage     = next_state->storage;
-  auto dataset     = raft::make_device_matrix_view<const value_type, int64_t>(
-    storage->dataset.data(), storage->num_rows_used, storage->dim);
+  auto dataset     = storage->view(0, storage->num_rows_used);
 
-  next_state->ann_index = index_state<UpstreamT>::build_upstream_ann(
-    res, next_state->build_params, next_state->build_fn, dataset);
+  next_state->ann_index =
+    index_state<UpstreamT>::build_upstream_ann(res,
+                                               next_state->build_params,
+                                               next_state->build_fn,
+                                               dataset,
+                                               static_cast<uint32_t>(storage->dim));
   return next_state;
 }
 }  // namespace cuvs::neighbors::tiered_index::detail

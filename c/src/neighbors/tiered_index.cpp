@@ -29,7 +29,7 @@
 namespace {
 using namespace cuvs::neighbors;
 
-enum class tiered_cagra_dataset_layout : uint8_t { not_applicable, device_padded, device_standard };
+enum class tiered_cagra_dataset_layout : uint8_t { not_applicable, device_padded };
 
 struct tiered_c_api_index_box {
   void* index_ptr;
@@ -67,10 +67,6 @@ static void with_tiered_cagra_index_by_layout(tiered_c_api_index_box* box,
                "with_tiered_cagra_index_by_layout requires CAGRA algo");
   if (box->cagra_layout == tiered_cagra_dataset_layout::device_padded) {
     auto* index_ptr = reinterpret_cast<tiered_index::index<cagra::device_padded_index<float, uint32_t>>*>(
-      box->index_ptr);
-    fn(index_ptr);
-  } else if (box->cagra_layout == tiered_cagra_dataset_layout::device_standard) {
-    auto* index_ptr = reinterpret_cast<tiered_index::index<cagra::device_standard_index<float, uint32_t>>*>(
       box->index_ptr);
     fn(index_ptr);
   } else {
@@ -147,10 +143,10 @@ void* _build(cuvsResources_t res, cuvsTieredIndexParams params, DLManagedTensor*
         return make_tiered_index_box(
           ptr, CUVS_TIERED_INDEX_ALGO_CAGRA, tiered_cagra_dataset_layout::device_padded);
       }
-      auto* ptr = new tiered_index::index<cagra::device_standard_index<T, uint32_t>>(
+      auto* ptr = new tiered_index::index<cagra::device_padded_index<T, uint32_t>>(
         tiered_index::build(*res_ptr, build_params, mds));
       return make_tiered_index_box(
-        ptr, CUVS_TIERED_INDEX_ALGO_CAGRA, tiered_cagra_dataset_layout::device_standard);
+        ptr, CUVS_TIERED_INDEX_ALGO_CAGRA, tiered_cagra_dataset_layout::device_padded);
     }
     case CUVS_TIERED_INDEX_ALGO_IVF_FLAT: {
       auto build_params = tiered_index::index_params<ivf_flat::index_params>();
