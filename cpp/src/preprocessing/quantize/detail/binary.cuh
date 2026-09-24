@@ -21,7 +21,7 @@
 #include <thrust/execution_policy.h>
 #include <thrust/sort.h>
 
-namespace cuvs::preprocessing::quantize::detail {
+namespace cuvs::preprocessing::quantize::binary::detail {
 
 template <class T>
 _RAFT_HOST_DEVICE bool is_positive(const T& a)
@@ -465,4 +465,4 @@ void transform(raft::resources const& res,
     }
   }
 }
-}  // namespace cuvs::preprocessing::quantize::detail
+}  // namespace cuvs::preprocessing::quantize::binary::detail
